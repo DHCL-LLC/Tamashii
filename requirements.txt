@@ -1,0 +1,3 @@
+bitarray==3.0.0
+bitstring==4.3.0
+loguru==0.7.3
