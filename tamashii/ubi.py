@@ -73,16 +73,16 @@ class PhysicalEraseBlock(StreamStructure):
         self.volume_identifier_header = VolumeIdentifierHeader(stream)
 
         # We store a copy of the block's remaining data.
-        block_remainder_size = block_size - self.erase_counter_header.data_offset
+        self.data_size = block_size - self.erase_counter_header.data_offset
 
-        data_position = (
+        self.data_position = (
             self._start_position +
             self.erase_counter_header.data_offset
         )
 
-        stream.bytepos = data_position
+        stream.bytepos = self.data_position
 
-        self._data = stream.read(f'bytes:{block_remainder_size}')
+        self._data = stream.read(f'bytes:{self.data_size}')
 
         # If the block is valid and internal, then we can parse the volume
         # table records out of its data.
@@ -94,7 +94,7 @@ class PhysicalEraseBlock(StreamStructure):
         self.volume_table_records = []
 
         if is_volume_table:
-            stream.bytepos = data_position
+            stream.bytepos = self.data_position
 
             # Up to 128 records are stored, but all possible spaces have a
             # volume table record.
@@ -107,7 +107,7 @@ class PhysicalEraseBlock(StreamStructure):
 
                 self.volume_table_records.append(record)
 
-            stream.bytepos = data_position + block_remainder_size
+            stream.bytepos = self.data_position + self.data_size
 
     @property
     def is_data_valid(self):
@@ -207,7 +207,7 @@ class VolumeTableRecord(StreamStructure):
         ('volume_type', 'uint:8'),
         ('update_marker', 'uint:8'),
         ('name_size', 'uint:16'),
-        ('name', 'bytes:128'),
+        ('_name', 'bytes:128'),
         ('flags', 'uint:8'),
         (None, 'bytes:23'),
         ('record_crc32', 'uint:32')
@@ -222,6 +222,10 @@ class VolumeTableRecord(StreamStructure):
         calculated_crc32 = generate_crc32(self._fields[:-4])
         return calculated_crc32 == self.record_crc32
 
+    @property
+    def name(self):
+        return self._name[:self.name_size].decode(errors='ignore')
+
     def to_json(self):
         json = super().to_json()
 
@@ -231,7 +235,7 @@ class VolumeTableRecord(StreamStructure):
 
         json.update({
             'volume': self.volume_id,
-            'name': self.name[:self.name_size].decode(errors='replace'),
+            'name': self.name,
             'recordCRC32': self.record_crc32,
             'isRecordValid': self.is_record_valid
         })
@@ -256,6 +260,8 @@ class UnsortedBlockImages(StreamStructure):
             raise ValueError('Only one physical erase block was found!')
 
         block_size, occurrences = block_sizes[0]
+        self.block_size = block_size
+        self.data_size = block_size
 
         # We then get the start for our desired block size, to prevent false-positives.
         block_start = get_physical_erase_block_start(data, block_size)
@@ -276,12 +282,84 @@ class UnsortedBlockImages(StreamStructure):
                 stream=stream
             )
 
+            if self.data_size == block_size:
+                self.data_size = block.data_size
+
             self.blocks.append(block)
 
         self._end_position = stream.bytepos
 
     def to_hex_dump(self, width=16):
         return to_hex_dump(self._data, width)
+
+    def get_internal_volume_blocks(self):
+        blocks = []
+
+        for block in self.blocks:
+            is_internal = (
+                block.volume_identifier_header.is_magic_valid and
+                block.volume_identifier_header.is_internal
+            )
+
+            if not is_internal:
+                continue
+
+            blocks.append(block)
+
+        return blocks
+
+    def get_volume_table_records(self):
+        internal_blocks = self.get_internal_volume_blocks()
+
+        if not internal_blocks:
+            raise RuntimeError('No internal blocks were found!')
+
+        block = internal_blocks[0]
+
+        if not block.volume_table_records:
+            raise RuntimeError('No volume table records were found!')
+
+        return block.volume_table_records
+
+    def get_logical_erase_blocks(self, volume_id):
+        volume_blocks = []
+
+        for block in self.blocks:
+            in_volume = (
+                block.volume_identifier_header.is_magic_valid and
+                block.volume_identifier_header.volume_id == volume_id
+            )
+
+            if not in_volume:
+                continue
+
+            volume_blocks.append(block)
+
+        return prepare_physical_erase_blocks(volume_blocks)
+
+    def read_volume(self, volume_table_record):
+        logical_erase_blocks = self.get_logical_erase_blocks(volume_table_record.volume_id)
+        volume = b''
+
+        for block_id in range(volume_table_record.reserved_physical_erase_blocks):
+            block = logical_erase_blocks.get(block_id)
+
+            if not block:
+                volume += b'\xFF' * self.data_size
+                continue
+
+            volume += block.data
+
+        return volume
+
+    def extract_volumes(self, path='.'):
+        volume_table_records = self.get_volume_table_records()
+
+        for record in volume_table_records:
+            volume = self.read_volume(record)
+
+            with open(f'{path}/volume-{record.volume_id}-{record.name}.bin', 'wb') as file:
+                file.write(volume)
 
 
 def generate_crc32(data):
@@ -317,10 +395,20 @@ def get_physical_erase_block_start(data, size):
 
 
 def prepare_physical_erase_blocks(blocks):
+    # We only keep blocks that have the latest image sequence.
+    max_image_sequence = max([
+        block.erase_counter_header.image_sequence for block in blocks
+    ])
+
+    filtered_blocks = [
+        block for block in blocks
+        if block.erase_counter_header.image_sequence == max_image_sequence
+    ]
+
     # We sort the blocks by their logical erase block number and then their
     # sequence number in descending order.
     sorted_blocks = sorted(
-        blocks,
+        filtered_blocks,
         key=lambda block: (
             block.volume_identifier_header.logical_erase_block_number,
             -block.volume_identifier_header.sequence_number
@@ -331,13 +419,14 @@ def prepare_physical_erase_blocks(blocks):
     # latest updated (because we sorted secondarily on the sequence number).
     unique_blocks = {}
 
-    for logical_erase_block_number, blocks in group_by(
+    for logical_erase_block_number, grouped_blocks in group_by(
         sorted_blocks,
         key=lambda block: block.volume_identifier_header.logical_erase_block_number
     ):
-        unique_blocks[logical_erase_block_number] = blocks[0]
+        grouped_blocks = list(grouped_blocks)
+        unique_blocks[logical_erase_block_number] = grouped_blocks[0]
 
-    return [
-        unique_blocks[logical_erase_block_number]
+    return {
+        logical_erase_block_number: unique_blocks[logical_erase_block_number]
         for logical_erase_block_number in sorted(unique_blocks)
-    ]
+    }
