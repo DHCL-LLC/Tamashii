@@ -27,16 +27,19 @@ class DeviceImageHeader(StreamStructure):
 
 
 class DeviceImage(StreamStructure):
-    def __init__(self, stream):
-        self.device_image_header = DeviceImageHeader(stream)
+    def __init__(self, data):
+        super().__init__(data)
+        stream = self._stream
 
-        stream.bytepos = self.device_image_header.header_size
-        self.image = stream.read(f'bytes:{self.device_image_header.image_size}')
+        self.header = DeviceImageHeader(stream)
+
+        stream.bytepos = self.header.header_size
+        self.image = stream.read(f'bytes:{self.header.image_size}')
 
     @property
     def is_image_valid(self):
         calculated_sha1 = SHA1(self.image).digest()
-        return calculated_sha1 == self.device_image_header.image_sha1
+        return calculated_sha1 == self.header.image_sha1
 
     def to_json(self):
         json = super().to_json()
@@ -48,3 +51,26 @@ class DeviceImage(StreamStructure):
         })
 
         return json
+
+    def get_flattened_device_tree(self, position):
+        stream = self._stream
+        stream.bytepos = position + 4
+        size = stream.read('uint:32')
+        stream.bytepos = position
+        return stream.read(f'bytes:{size}')
+
+    def get_fdt(self, *args, **kwargs):
+        return self.get_flattened_device_tree(*args, **kwargs)
+
+    def get_uimage(self, position):
+        stream = self._stream
+        stream.bytepos = position + 12
+        size = stream.read('uint:32')
+        stream.bytepos = position
+        return stream.read(f'bytes:{size}')
+
+    def get_kernel(self, position):
+        return self.get_uimage(position)
+
+    def get_ramdisk(self, position):
+        return self.get_uimage(position)

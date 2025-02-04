@@ -5,9 +5,20 @@ from bitstring import ConstBitStream
 class StreamStructure:
     FIELDS = []
 
-    def __init__(self, stream):
-        if not isinstance(stream, ConstBitStream):
-            stream = ConstBitStream(stream)
+    def __init__(self, data):
+        if not isinstance(data, ConstBitStream):
+            stream = ConstBitStream(data)
+        else:
+            stream = data
+
+        self._stream = stream
+
+        if not self.FIELDS:
+            self._start_position = 0
+            self._end_position = 0
+            self._size = 0
+            self._fields = b''
+            return
 
         self._start_position = stream.bytepos
 

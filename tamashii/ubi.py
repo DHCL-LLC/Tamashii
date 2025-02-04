@@ -29,6 +29,10 @@ class EraseCounterHeader(StreamStructure):
     ]
 
     @property
+    def vid_offset(self):
+        return self.volume_identifier_header_offset
+
+    @property
     def is_magic_valid(self):
         # The magic signature should be "UBI#".
         return self.magic_signature == 0x55424923
@@ -53,7 +57,10 @@ class EraseCounterHeader(StreamStructure):
 
 
 class PhysicalEraseBlock(StreamStructure):
-    def __init__(self, block_id, block_size, stream):
+    def __init__(self, block_id, block_size, data):
+        super().__init__(data)
+        stream = self._stream
+
         self.block_id = block_id
 
         # We use this to keep track of where the physical erase block started.
@@ -63,21 +70,21 @@ class PhysicalEraseBlock(StreamStructure):
         self.erase_counter_header = EraseCounterHeader(stream)
 
         # We parse the block's volume identifier header.
-        volume_identifier_header_position = (
+        vid_position = (
             self._start_position +
-            self.erase_counter_header.volume_identifier_header_offset
+            self.ec_header.vid_offset
         )
 
-        stream.bytepos = volume_identifier_header_position
+        stream.bytepos = vid_position
 
         self.volume_identifier_header = VolumeIdentifierHeader(stream)
 
         # We store a copy of the block's remaining data.
-        self.data_size = block_size - self.erase_counter_header.data_offset
+        self.data_size = block_size - self.ec_header.data_offset
 
         self.data_position = (
             self._start_position +
-            self.erase_counter_header.data_offset
+            self.ec_header.data_offset
         )
 
         stream.bytepos = self.data_position
@@ -87,8 +94,8 @@ class PhysicalEraseBlock(StreamStructure):
         # If the block is valid and internal, then we can parse the volume
         # table records out of its data.
         is_volume_table = (
-            self.volume_identifier_header.is_magic_valid and
-            self.volume_identifier_header.is_internal
+            self.vid_header.is_magic_valid and
+            self.vid_header.is_internal
         )
 
         self.volume_table_records = []
@@ -110,12 +117,20 @@ class PhysicalEraseBlock(StreamStructure):
             stream.bytepos = self.data_position + self.data_size
 
     @property
+    def ec_header(self):
+        return self.erase_counter_header
+
+    @property
+    def vid_header(self):
+        return self.volume_identifier_header
+
+    @property
     def is_data_valid(self):
-        if not self.volume_identifier_header.is_magic_valid:
+        if not self.vid_header.is_magic_valid:
             return False
 
         calculated_crc32 = generate_crc32(self.data)
-        return calculated_crc32 == self.volume_identifier_header.data_crc32
+        return calculated_crc32 == self.vid_header.data_crc32
 
     def to_hex_dump(self, width=16):
         return to_hex_dump(self._data, width)
@@ -134,15 +149,15 @@ class PhysicalEraseBlock(StreamStructure):
 
     @property
     def data(self):
-        if not self.volume_identifier_header.is_magic_valid:
+        if not self.vid_header.is_magic_valid:
             return b''
 
-        volume_type = VolumeTypeEnum(self.volume_identifier_header.volume_type)
+        volume_type = VolumeTypeEnum(self.vid_header.volume_type)
 
         if volume_type == VolumeTypeEnum.DYNAMIC:
             return self._data
         elif volume_type == VolumeTypeEnum.STATIC:
-            return self._data[:self.volume_identifier_header.data_size]
+            return self._data[:self.vid_header.data_size]
 
 
 class VolumeIdentifierHeader(StreamStructure):
@@ -164,6 +179,10 @@ class VolumeIdentifierHeader(StreamStructure):
         (None, 'bytes:12'),
         ('header_crc32', 'uint:32')
     ]
+
+    @property
+    def leb_number(self):
+        return self.logical_erase_block_number
 
     @property
     def is_internal(self):
@@ -213,9 +232,13 @@ class VolumeTableRecord(StreamStructure):
         ('record_crc32', 'uint:32')
     ]
 
-    def __init__(self, volume_id, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, volume_id, data):
+        super().__init__(data)
         self.volume_id = volume_id
+
+    @property
+    def reserved_pebs(self):
+        return self.reserved_physical_erase_blocks
 
     @property
     def is_record_valid(self):
@@ -248,13 +271,13 @@ class UnsortedBlockImages(StreamStructure):
         self._data = data
 
         # We start out by checking whether any blocks are in the data.
-        has_blocks = has_physical_erase_block(data)
+        has_blocks = has_peb(data)
 
         if not has_blocks:
             raise ValueError('No physical erase blocks were found!')
 
         # We then begin to estimate the block size.
-        block_sizes = get_physical_erase_block_sizes(data)
+        block_sizes = get_peb_sizes(data)
 
         if len(block_sizes) == 0:
             raise ValueError('Only one physical erase block was found!')
@@ -264,7 +287,7 @@ class UnsortedBlockImages(StreamStructure):
         self.data_size = block_size
 
         # We then get the start for our desired block size, to prevent false-positives.
-        block_start = get_physical_erase_block_start(data, block_size)
+        block_start = get_peb_start(data, block_size)
         self._start_position = block_start
 
         # We can now start reading the UBI blocks.
@@ -279,7 +302,7 @@ class UnsortedBlockImages(StreamStructure):
             block = PhysicalEraseBlock(
                 block_id=index,
                 block_size=block_size,
-                stream=stream
+                data=stream
             )
 
             if self.data_size == block_size:
@@ -297,8 +320,8 @@ class UnsortedBlockImages(StreamStructure):
 
         for block in self.blocks:
             is_internal = (
-                block.volume_identifier_header.is_magic_valid and
-                block.volume_identifier_header.is_internal
+                block.vid_header.is_magic_valid and
+                block.vid_header.is_internal
             )
 
             if not is_internal:
@@ -326,8 +349,8 @@ class UnsortedBlockImages(StreamStructure):
 
         for block in self.blocks:
             in_volume = (
-                block.volume_identifier_header.is_magic_valid and
-                block.volume_identifier_header.volume_id == volume_id
+                block.vid_header.is_magic_valid and
+                block.vid_header.volume_id == volume_id
             )
 
             if not in_volume:
@@ -337,7 +360,10 @@ class UnsortedBlockImages(StreamStructure):
 
         return prepare_physical_erase_blocks(volume_blocks)
 
-    def read_volume(self, volume_table_record):
+    def get_lebs(self, *args, **kwargs):
+        return self.get_logical_erase_blocks(*args, **kwargs)
+
+    def get_volume(self, volume_table_record):
         logical_erase_blocks = self.get_logical_erase_blocks(volume_table_record.volume_id)
         volume = b''
 
@@ -356,7 +382,7 @@ class UnsortedBlockImages(StreamStructure):
         volume_table_records = self.get_volume_table_records()
 
         for record in volume_table_records:
-            volume = self.read_volume(record)
+            volume = self.get_volume(record)
 
             with open(f'{path}/volume-{record.volume_id}-{record.name}.bin', 'wb') as file:
                 file.write(volume)
@@ -378,8 +404,14 @@ def get_physical_erase_block_sizes(data):
     return sorted(offsets.items(), key=lambda item: item[1], reverse=True)
 
 
+get_peb_sizes = get_physical_erase_block_sizes
+
+
 def has_physical_erase_block(data):
     return search(b'UBI#', data) is not None
+
+
+has_peb = has_physical_erase_block
 
 
 def get_physical_erase_block_start(data, size):
@@ -394,15 +426,18 @@ def get_physical_erase_block_start(data, size):
     return None
 
 
+get_peb_start = get_physical_erase_block_start
+
+
 def prepare_physical_erase_blocks(blocks):
     # We only keep blocks that have the latest image sequence.
     max_image_sequence = max([
-        block.erase_counter_header.image_sequence for block in blocks
+        block.ec_header.image_sequence for block in blocks
     ])
 
     filtered_blocks = [
         block for block in blocks
-        if block.erase_counter_header.image_sequence == max_image_sequence
+        if block.ec_header.image_sequence == max_image_sequence
     ]
 
     # We sort the blocks by their logical erase block number and then their
@@ -410,8 +445,8 @@ def prepare_physical_erase_blocks(blocks):
     sorted_blocks = sorted(
         filtered_blocks,
         key=lambda block: (
-            block.volume_identifier_header.logical_erase_block_number,
-            -block.volume_identifier_header.sequence_number
+            block.vid_header.logical_erase_block_number,
+            -block.vid_header.sequence_number
         )
     )
 
@@ -419,14 +454,17 @@ def prepare_physical_erase_blocks(blocks):
     # latest updated (because we sorted secondarily on the sequence number).
     unique_blocks = {}
 
-    for logical_erase_block_number, grouped_blocks in group_by(
+    for leb_number, grouped_blocks in group_by(
         sorted_blocks,
-        key=lambda block: block.volume_identifier_header.logical_erase_block_number
+        key=lambda block: block.vid_header.leb_number
     ):
         grouped_blocks = list(grouped_blocks)
-        unique_blocks[logical_erase_block_number] = grouped_blocks[0]
+        unique_blocks[leb_number] = grouped_blocks[0]
 
     return {
-        logical_erase_block_number: unique_blocks[logical_erase_block_number]
-        for logical_erase_block_number in sorted(unique_blocks)
+        leb_number: unique_blocks[leb_number]
+        for leb_number in sorted(unique_blocks)
     }
+
+
+prepare_pebs = prepare_physical_erase_blocks
