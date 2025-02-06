@@ -1,39 +1,86 @@
 #!/usr/bin/env python3
+from struct import pack
+
 from bitstring import ConstBitStream
 
 
 class StreamStructure:
     FIELDS = []
 
-    def __init__(self, data):
-        if not isinstance(data, ConstBitStream):
-            stream = ConstBitStream(data)
-        else:
+    def __init__(self, **kwargs):
+        field_names = [name for name, _ in self.FIELDS]
+
+        for key, value in kwargs.items():
+            if key not in field_names:
+                raise ValueError(f'An unexpected keyword argument was supplied: {key}')
+
+            setattr(self, key, value)
+
+    @classmethod
+    def from_data(this, data, **kwargs):
+        # We start out by checking whether or not there are any fields to parse.
+        if not this.FIELDS:
+            return this(**kwargs)
+
+        # We then read in the fields from the data as a stream.
+        if isinstance(data, ConstBitStream):
             stream = data
+        else:
+            stream = ConstBitStream(data)
 
-        self._stream = stream
+        values = {}
 
-        if not self.FIELDS:
-            self._start_position = 0
-            self._end_position = 0
-            self._size = 0
-            self._fields = b''
-            return
-
-        self._start_position = stream.bytepos
-
-        for field, format_string in self.FIELDS:
+        for field, format_string in this.FIELDS:
             if not field:
                 stream.read(format_string)
                 continue
 
-            setattr(self, field, stream.read(format_string))
+            values[field] = stream.read(format_string)
 
-        # We calculate the size of the fields and store it in the class.
-        self._end_position = stream.bytepos
-        self._size = (self._end_position - self._start_position)
-        stream.bytepos = self._start_position
-        self._fields = stream.read(f'bytes:{self._size}')
+        return this(
+            **values,
+            **kwargs
+        )
+
+    def to_bytes(self):
+        field_bytes = []
+
+        for field, format_string in self.FIELDS:
+            if not field:
+                if not format_string.startswith('bytes'):
+                    raise ValueError(f'Unsupported field type for unused: {format_string}')
+
+                size = int(format_string.split(':')[1])
+                field_bytes.append(b'\x00' * size)
+                continue
+
+            value = getattr(self, field)
+
+            if format_string.startswith('bytes'):
+                size = int(format_string.split(':')[1])
+
+                if len(value) != size:
+                    raise ValueError(f"{field} must be exactly {size} bytes.")
+
+                field_bytes.append(value)
+
+            elif format_string.startswith('uint'):
+                bits = int(format_string.split(':')[1])
+
+                if bits == 8:
+                    field_bytes.append(pack('>B', value))
+                elif bits == 16:
+                    field_bytes.append(pack('>H', value))
+                elif bits == 32:
+                    field_bytes.append(pack('>I', value))
+                elif bits == 64:
+                    field_bytes.append(pack('>Q', value))
+                else:
+                    raise ValueError(f"Unsupported uint size: {bits} bits")
+            else:
+                raise ValueError(f"Unsupported field type: {format_string}")
+
+        return b''.join(field_bytes)
 
     def to_json(self):
         json = {}
@@ -60,9 +107,6 @@ class StreamStructure:
 
         return json
 
-    def to_hex_dump(self, width=16):
-        return to_hex_dump(self._fields, width)
-
 
 def to_hex_dump(data, max_width=16):
     lines = []
@@ -81,16 +125,6 @@ def to_hex_dump(data, max_width=16):
         lines.append(f'{offset:08x}  {hex_bytes:<{max_width * 3}}  {ascii_bytes}')
 
     return '\n'.join(lines)
-
-
-def to_truncated_hex(data, max_width=32):
-    string = data.hex()
-
-    if len(string) <= max_width:
-        return string
-
-    keep = (max_width - 4) // 2
-    return f'{string[:keep]}....{string[:-keep]}'
 
 
 def to_camel_case(string):

@@ -4,6 +4,7 @@ from enum import Enum
 from zlib import crc32 as CRC32
 from itertools import groupby as group_by
 from base64 import standard_b64encode as encode_base64
+from math import ceil
 
 from bitstring import ConstBitStream
 
@@ -28,6 +29,31 @@ class EraseCounterHeader(StreamStructure):
         ('header_crc32', 'uint:32')
     ]
 
+    def __init__(
+        self,
+        magic_signature=0x55424923,
+        ubi_version=1,
+        erase_counter=0,
+        volume_identifier_header_offset=512,
+        data_offset=2048,
+        image_sequence=0,
+        header_crc32=None,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.magic_signature = magic_signature
+        self.ubi_version = ubi_version
+        self.erase_counter = erase_counter
+        self.volume_identifier_header_offset = volume_identifier_header_offset
+        self.data_offset = data_offset
+        self.image_sequence = image_sequence
+
+        if header_crc32 is None:
+            self.header_crc32 = 0
+            self.refresh_header_crc32()
+        else:
+            self.header_crc32 = header_crc32
+
     @property
     def vid_offset(self):
         return self.volume_identifier_header_offset
@@ -39,8 +65,13 @@ class EraseCounterHeader(StreamStructure):
 
     @property
     def is_header_valid(self):
-        calculated_crc32 = generate_crc32(self._fields[:-4])
-        return calculated_crc32 == self.header_crc32
+        return self.header_crc32 == self.get_header_crc32()
+
+    def refresh_header_crc32(self):
+        self.header_crc32 = self.get_header_crc32()
+
+    def get_header_crc32(self):
+        return generate_crc32(self.to_bytes()[:-4])
 
     def to_json(self):
         json = super().to_json()
@@ -54,110 +85,6 @@ class EraseCounterHeader(StreamStructure):
         })
 
         return json
-
-
-class PhysicalEraseBlock(StreamStructure):
-    def __init__(self, block_id, block_size, data):
-        super().__init__(data)
-        stream = self._stream
-
-        self.block_id = block_id
-
-        # We use this to keep track of where the physical erase block started.
-        self._start_position = stream.bytepos
-
-        # We parse the block's erase counter header.
-        self.erase_counter_header = EraseCounterHeader(stream)
-
-        # We parse the block's volume identifier header.
-        vid_position = (
-            self._start_position +
-            self.ec_header.vid_offset
-        )
-
-        stream.bytepos = vid_position
-
-        self.volume_identifier_header = VolumeIdentifierHeader(stream)
-
-        # We store a copy of the block's remaining data.
-        self.data_size = block_size - self.ec_header.data_offset
-
-        self.data_position = (
-            self._start_position +
-            self.ec_header.data_offset
-        )
-
-        stream.bytepos = self.data_position
-
-        self._data = stream.read(f'bytes:{self.data_size}')
-
-        # If the block is valid and internal, then we can parse the volume
-        # table records out of its data.
-        is_volume_table = (
-            self.vid_header.is_magic_valid and
-            self.vid_header.is_internal
-        )
-
-        self.volume_table_records = []
-
-        if is_volume_table:
-            stream.bytepos = self.data_position
-
-            # Up to 128 records are stored, but all possible spaces have a
-            # volume table record.
-            for index in range(128):
-                record = VolumeTableRecord(index, stream)
-
-                # If the record is all 0x00, as indicated by its checksum, we skip it.
-                if record.record_crc32 == 0xF116C36B:
-                    continue
-
-                self.volume_table_records.append(record)
-
-            stream.bytepos = self.data_position + self.data_size
-
-    @property
-    def ec_header(self):
-        return self.erase_counter_header
-
-    @property
-    def vid_header(self):
-        return self.volume_identifier_header
-
-    @property
-    def is_data_valid(self):
-        if not self.vid_header.is_magic_valid:
-            return False
-
-        calculated_crc32 = generate_crc32(self.data)
-        return calculated_crc32 == self.vid_header.data_crc32
-
-    def to_hex_dump(self, width=16):
-        return to_hex_dump(self._data, width)
-
-    def to_json(self):
-        json = super().to_json()
-
-        del json['blockId']
-
-        json.update({
-            'block': self.block_id,
-            'data': encode_base64(self.data).decode()
-        })
-
-        return json
-
-    @property
-    def data(self):
-        if not self.vid_header.is_magic_valid:
-            return b''
-
-        volume_type = VolumeTypeEnum(self.vid_header.volume_type)
-
-        if volume_type == VolumeTypeEnum.DYNAMIC:
-            return self._data
-        elif volume_type == VolumeTypeEnum.STATIC:
-            return self._data[:self.vid_header.data_size]
 
 
 class VolumeIdentifierHeader(StreamStructure):
@@ -180,6 +107,43 @@ class VolumeIdentifierHeader(StreamStructure):
         ('header_crc32', 'uint:32')
     ]
 
+    def __init__(
+        self,
+        volume_id,
+        logical_erase_block_number,
+        magic_signature=0x55424921,
+        ubi_version=1,
+        volume_type=VolumeTypeEnum.DYNAMIC,
+        copy_flag=0,
+        compatibility=0,
+        data_size=0,
+        used_erase_blocks=0,
+        data_padding=0,
+        data_crc32=0,
+        sequence_number=0,
+        header_crc32=None,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.volume_id = volume_id
+        self.logical_erase_block_number = logical_erase_block_number
+        self.magic_signature = magic_signature
+        self.ubi_version = ubi_version
+        self.volume_type = volume_type.value if isinstance(volume_type, VolumeTypeEnum) else volume_type
+        self.copy_flag = copy_flag
+        self.compatibility = compatibility
+        self.data_size = data_size
+        self.used_erase_blocks = used_erase_blocks
+        self.data_padding = data_padding
+        self.data_crc32 = data_crc32
+        self.sequence_number = sequence_number
+
+        if header_crc32 is None:
+            self.header_crc32 = 0
+            self.refresh_header_crc32()
+        else:
+            self.header_crc32 = header_crc32
+
     @property
     def leb_number(self):
         return self.logical_erase_block_number
@@ -196,8 +160,13 @@ class VolumeIdentifierHeader(StreamStructure):
 
     @property
     def is_header_valid(self):
-        calculated_crc32 = generate_crc32(self._fields[:-4])
-        return calculated_crc32 == self.header_crc32
+        return self.header_crc32 == self.get_header_crc32()
+
+    def refresh_header_crc32(self):
+        self.header_crc32 = self.get_header_crc32()
+
+    def get_header_crc32(self):
+        return generate_crc32(self.to_bytes()[:-4])
 
     def to_json(self):
         json = super().to_json()
@@ -205,10 +174,8 @@ class VolumeIdentifierHeader(StreamStructure):
         # We touch-up some of the fields.
         del json['dataCrc32']
         del json['headerCrc32']
-        del json['volumeId']
 
         json.update({
-            'volume': self.volume_id,
             'dataCRC32': self.data_crc32,
             'headerCRC32': self.header_crc32,
             'isHeaderValid': self.is_header_valid,
@@ -232,9 +199,48 @@ class VolumeTableRecord(StreamStructure):
         ('record_crc32', 'uint:32')
     ]
 
-    def __init__(self, volume_id, data):
-        super().__init__(data)
+    def __init__(
+        self,
+        volume_id,
+        reserved_physical_erase_blocks=0,
+        alignment=1,
+        data_padding=0,
+        volume_type=VolumeTypeEnum.DYNAMIC,
+        update_marker=0,
+        name_size=0,
+        _name=(b'\x00' * 128),
+        flags=0,
+        record_crc32=None,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
         self.volume_id = volume_id
+        self.reserved_physical_erase_blocks = reserved_physical_erase_blocks
+        self.alignment = alignment
+        self.data_padding = data_padding
+
+        if isinstance(volume_type, VolumeTypeEnum):
+            volume_type = volume_type.value
+
+        self.volume_type = volume_type
+        self.update_marker = update_marker
+
+        if len(_name) < 128:
+            _name += b'\x00' * (128 - len(_name))
+
+        self.name_size = name_size
+        self._name = _name
+        self.flags = flags
+
+        if record_crc32 is None:
+            self.record_crc32 = 0
+            self.refresh_record_crc32()
+        else:
+            self.record_crc32 = record_crc32
+
+    @classmethod
+    def from_data(this, data, volume_id, **kwargs):
+        return super().from_data(data, volume_id=volume_id, **kwargs)
 
     @property
     def reserved_pebs(self):
@@ -242,8 +248,13 @@ class VolumeTableRecord(StreamStructure):
 
     @property
     def is_record_valid(self):
-        calculated_crc32 = generate_crc32(self._fields[:-4])
-        return calculated_crc32 == self.record_crc32
+        return self.record_crc32 == self.get_record_crc32()
+
+    def refresh_record_crc32(self):
+        self.record_crc32 = self.get_record_crc32()
+
+    def get_record_crc32(self):
+        return generate_crc32(self.to_bytes()[:-4])
 
     @property
     def name(self):
@@ -254,10 +265,8 @@ class VolumeTableRecord(StreamStructure):
 
         # We touch-up some of the fields.
         del json['recordCrc32']
-        del json['volumeId']
 
         json.update({
-            'volume': self.volume_id,
             'name': self.name,
             'recordCRC32': self.record_crc32,
             'isRecordValid': self.is_record_valid
@@ -266,10 +275,165 @@ class VolumeTableRecord(StreamStructure):
         return json
 
 
-class UnsortedBlockImages(StreamStructure):
-    def __init__(self, data):
+class PhysicalEraseBlock(StreamStructure):
+    def __init__(
+        self,
+        block_id,
+        erase_counter_header,
+        volume_identifier_header,
+        volume_table_records=None,
+        data=b'',
+        data_size=(126 * 1024),
+        block_size=(128 * 1024),
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.block_id = block_id
+        self.erase_counter_header = erase_counter_header
+        self.volume_identifier_header = volume_identifier_header
+        self.volume_table_records = volume_table_records or []
         self._data = data
+        self.data_size = data_size
+        self.block_size = block_size
 
+    @classmethod
+    def from_data(this, data, block_id, block_size=(128 * 1024), **kwargs):
+        if isinstance(data, ConstBitStream):
+            stream = data
+        else:
+            stream = ConstBitStream(data)
+
+        start_position = stream.bytepos
+
+        # We start by reading the erase counter header.
+        ec_header = EraseCounterHeader.from_data(stream)
+
+        # We then use that header to calculate the volume identifier header
+        # position and parse it.
+        stream.bytepos = start_position + ec_header.vid_offset
+        vid_header = VolumeIdentifierHeader.from_data(stream)
+
+        # We then calculate the block data size and its position.
+        data_size = block_size - ec_header.data_offset
+        data_position = start_position + ec_header.data_offset
+
+        # We then read the data from the block.
+        stream.bytepos = data_position
+        data = stream.read(f'bytes:{data_size}')
+
+        # If the block is valid and internal, then we can parse some volume
+        # table records out of its data.
+        is_volume_table = (
+            vid_header.is_magic_valid and
+            vid_header.is_internal
+        )
+
+        volume_table_records = []
+
+        if is_volume_table:
+            stream.bytepos = data_position
+
+            # Up to 128 records are stored, but all possible spaces have a
+            # volume table record.
+            for index in range(128):
+                record = VolumeTableRecord.from_data(stream, index)
+
+                # If the record is all 0x00, as indicated by its checksum, we skip it.
+                if record.record_crc32 == 0xF116C36B:
+                    continue
+
+                volume_table_records.append(record)
+
+            stream.bytepos = data_position + data_size
+
+        return this(
+            block_id=block_id,
+            erase_counter_header=ec_header,
+            volume_identifier_header=vid_header,
+            volume_table_records=volume_table_records,
+            data=data,
+            data_size=data_size,
+            block_size=block_size,
+            **kwargs
+        )
+
+    @property
+    def ec_header(self):
+        return self.erase_counter_header
+
+    @property
+    def vid_header(self):
+        return self.volume_identifier_header
+
+    @property
+    def is_data_valid(self):
+        if not self.vid_header.is_magic_valid:
+            return False
+
+        return self.vid_header.data_crc32 == self.get_data_crc32()
+
+    def refresh_data_crc32(self):
+        self.vid_header.data_crc32 = self.get_data_crc32()
+
+    def get_data_crc32(self):
+        return generate_crc32(self.data)
+
+    @property
+    def data(self):
+        if not self.vid_header.is_magic_valid:
+            return b''
+
+        volume_type = VolumeTypeEnum(self.vid_header.volume_type)
+
+        if volume_type == VolumeTypeEnum.DYNAMIC:
+            return self._data
+        elif volume_type == VolumeTypeEnum.STATIC:
+            return self._data[:self.vid_header.data_size]
+
+    def to_json(self):
+        json = super().to_json()
+
+        json.update({
+            'data': encode_base64(self.data).decode()
+        })
+
+        return json
+
+    def to_bytes(self):
+        result = b''
+
+        # We add the erase counter header and its padding.
+        result += self.ec_header.to_bytes()
+        result += b'\xFF' * (self.ec_header.vid_offset - len(result))
+
+        # We add the volume identifier header and its padding.
+        result += self.vid_header.to_bytes()
+        result += b'\xFF' * (self.ec_header.data_offset - len(result))
+
+        # We finally add the data and its padding.
+        result += self.data
+        result += b'\xFF' * (self.block_size - len(result))
+
+        return result
+
+
+class UnsortedBlockImages(StreamStructure):
+    def __init__(
+        self,
+        blocks=None,
+        start_position=0,
+        data_size=(126 * 1024),
+        block_size=(128 * 1024),
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.blocks = blocks or []
+        self.start_position = start_position
+        self.data_size = data_size
+        self.block_size = block_size
+
+    @classmethod
+    def from_data(this, data, **kwargs):
         # We start out by checking whether any blocks are in the data.
         has_blocks = has_peb(data)
 
@@ -280,40 +444,43 @@ class UnsortedBlockImages(StreamStructure):
         block_sizes = get_peb_sizes(data)
 
         if len(block_sizes) == 0:
-            raise ValueError('Only one physical erase block was found!')
+            raise ValueError('No physical erase blocks were found!')
 
         block_size, occurrences = block_sizes[0]
-        self.block_size = block_size
-        self.data_size = block_size
 
         # We then get the start for our desired block size, to prevent false-positives.
-        block_start = get_peb_start(data, block_size)
-        self._start_position = block_start
+        start_position = get_peb_start(data, block_size)
 
         # We can now start reading the UBI blocks.
         stream = ConstBitStream(data)
 
-        self.blocks = []
+        blocks = []
+
+        data_size = None
 
         for index in range(occurrences):
-            offset = block_start + (block_size * index)
+            offset = start_position + (block_size * index)
             stream.bytepos = offset
 
-            block = PhysicalEraseBlock(
+            block = PhysicalEraseBlock.from_data(
+                stream,
                 block_id=index,
-                block_size=block_size,
-                data=stream
+                block_size=block_size
             )
 
-            if self.data_size == block_size:
-                self.data_size = block.data_size
+            if data_size is None:
+                data_size = block.data_size
 
-            self.blocks.append(block)
+            blocks.append(block)
 
-        self._end_position = stream.bytepos
-
-    def to_hex_dump(self, width=16):
-        return to_hex_dump(self._data, width)
+        return super().from_data(
+            stream,
+            start_position=start_position,
+            blocks=blocks,
+            data_size=data_size,
+            block_size=block_size,
+            **kwargs
+        )
 
     def get_internal_volume_blocks(self):
         blocks = []
@@ -337,6 +504,8 @@ class UnsortedBlockImages(StreamStructure):
         if not internal_blocks:
             raise RuntimeError('No internal blocks were found!')
 
+        # All internal volumes treat their blocks as if they contain volume
+        # table records, so we pick the first internal block and work with it.
         block = internal_blocks[0]
 
         if not block.volume_table_records:
@@ -378,14 +547,13 @@ class UnsortedBlockImages(StreamStructure):
 
         return volume
 
-    def extract_volumes(self, path='.'):
-        volume_table_records = self.get_volume_table_records()
+    def to_bytes(self):
+        result = []
 
-        for record in volume_table_records:
-            volume = self.get_volume(record)
+        for block in self.blocks:
+            result.append(block.to_bytes())
 
-            with open(f'{path}/volume-{record.volume_id}-{record.name}.bin', 'wb') as file:
-                file.write(volume)
+        return b''.join(result)
 
 
 def generate_crc32(data):
@@ -468,3 +636,24 @@ def prepare_physical_erase_blocks(blocks):
 
 
 prepare_pebs = prepare_physical_erase_blocks
+
+
+def calculate_logical_erase_blocks(image, data_size):
+    lebs = []
+
+    blocks = ceil(len(image) / data_size)
+    empty_data = b'\xFF' * data_size
+
+    for index in range(blocks):
+        start_position = index * data_size
+        end_position = start_position + data_size
+
+        block_data = image[start_position:end_position]
+
+        if block_data != empty_data:
+            lebs.append(index)
+
+    return lebs
+
+
+calculate_lebs = calculate_logical_erase_blocks
