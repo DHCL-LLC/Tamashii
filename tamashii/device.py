@@ -125,7 +125,7 @@ class DeviceImage(StreamStructure):
         stream.bytepos = position + 12
         size = stream.read('uint:32')
         stream.bytepos = position
-        return stream.read(f'bytes:{size}')
+        return stream.read(f'bytes:{size + 64}')
 
     def get_kernel(self, *args, **kwargs):
         return self.get_uimage(*args, **kwargs)
