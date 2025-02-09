@@ -280,7 +280,7 @@ class PhysicalEraseBlock(StreamStructure):
         self,
         block_id,
         erase_counter_header,
-        volume_identifier_header,
+        volume_identifier_header=None,
         volume_table_records=None,
         data=b'',
         data_size=(126 * 1024),
@@ -323,28 +323,26 @@ class PhysicalEraseBlock(StreamStructure):
 
         # If the block is valid and internal, then we can parse some volume
         # table records out of its data.
-        is_volume_table = (
-            vid_header.is_magic_valid and
-            vid_header.is_internal
-        )
-
         volume_table_records = []
 
-        if is_volume_table:
-            stream.bytepos = data_position
+        if vid_header.is_magic_valid:
+            if vid_header.is_internal:
+                stream.bytepos = data_position
 
-            # Up to 128 records are stored, but all possible spaces have a
-            # volume table record.
-            for index in range(128):
-                record = VolumeTableRecord.from_data(stream, index)
+                # Up to 128 records are stored, but all possible spaces have a
+                # volume table record.
+                for index in range(128):
+                    record = VolumeTableRecord.from_data(stream, index)
 
-                # If the record is all 0x00, as indicated by its checksum, we skip it.
-                if record.record_crc32 == 0xF116C36B:
-                    continue
+                    # If the record is all 0x00, as indicated by its checksum, we skip it.
+                    if record.record_crc32 == 0xF116C36B:
+                        continue
 
-                volume_table_records.append(record)
+                    volume_table_records.append(record)
 
-            stream.bytepos = data_position + data_size
+                stream.bytepos = data_position + data_size
+        else:
+            vid_header = None
 
         return this(
             block_id=block_id,
@@ -367,20 +365,24 @@ class PhysicalEraseBlock(StreamStructure):
 
     @property
     def is_data_valid(self):
-        if not self.vid_header.is_magic_valid:
+        if not self.vid_header:
             return False
 
         return self.vid_header.data_crc32 == self.get_data_crc32()
 
     def refresh_data_crc32(self):
+        if not self.vid_header:
+            return False
+
         self.vid_header.data_crc32 = self.get_data_crc32()
+        return True
 
     def get_data_crc32(self):
         return generate_crc32(self.data)
 
     @property
     def data(self):
-        if not self.vid_header.is_magic_valid:
+        if not self.vid_header:
             return b''
 
         volume_type = VolumeTypeEnum(self.vid_header.volume_type)
@@ -406,8 +408,11 @@ class PhysicalEraseBlock(StreamStructure):
         result += self.ec_header.to_bytes()
         result += b'\xFF' * (self.ec_header.vid_offset - len(result))
 
-        # We add the volume identifier header and its padding.
-        result += self.vid_header.to_bytes()
+        # We add the volume identifier header and its padding, but only if
+        # it's valid. If invalid, the header area will be filled with 0xFF.
+        if self.vid_header:
+            result += self.vid_header.to_bytes()
+
         result += b'\xFF' * (self.ec_header.data_offset - len(result))
 
         # We finally add the data and its padding.
@@ -422,6 +427,7 @@ class UnsortedBlockImages(StreamStructure):
         self,
         blocks=None,
         start_position=0,
+        end_position=None,
         data_size=(126 * 1024),
         block_size=(128 * 1024),
         **kwargs
@@ -429,6 +435,12 @@ class UnsortedBlockImages(StreamStructure):
         super().__init__(**kwargs)
         self.blocks = blocks or []
         self.start_position = start_position
+
+        if end_position is None:
+            self.end_position = start_position + (len(blocks) * block_size)
+        else:
+            self.end_position = end_position
+
         self.data_size = data_size
         self.block_size = block_size
 
@@ -448,6 +460,9 @@ class UnsortedBlockImages(StreamStructure):
 
         block_size, occurrences = block_sizes[0]
 
+        # We're short one block since the last block can't be used for size estimation.
+        block_count = occurrences + 1
+
         # We then get the start for our desired block size, to prevent false-positives.
         start_position = get_peb_start(data, block_size)
 
@@ -458,7 +473,7 @@ class UnsortedBlockImages(StreamStructure):
 
         data_size = None
 
-        for index in range(occurrences):
+        for index in range(block_count):
             offset = start_position + (block_size * index)
             stream.bytepos = offset
 
@@ -473,9 +488,12 @@ class UnsortedBlockImages(StreamStructure):
 
             blocks.append(block)
 
+        end_position = start_position + (block_size * block_count)
+
         return super().from_data(
             stream,
             start_position=start_position,
+            end_position=end_position,
             blocks=blocks,
             data_size=data_size,
             block_size=block_size,
@@ -487,7 +505,7 @@ class UnsortedBlockImages(StreamStructure):
 
         for block in self.blocks:
             is_internal = (
-                block.vid_header.is_magic_valid and
+                block.vid_header and
                 block.vid_header.is_internal
             )
 
@@ -513,12 +531,68 @@ class UnsortedBlockImages(StreamStructure):
 
         return block.volume_table_records
 
+    def get_free_blocks(self):
+        free_blocks = {}
+
+        for block_id, block in enumerate(self.blocks):
+            if block.vid_header:
+                continue
+
+            free_blocks[block_id] = block
+
+        return free_blocks
+
+    def delete_volume_blocks(self, volume_id):
+        for block_id in range(len(self.blocks)):
+            block = self.blocks[block_id]
+
+            in_volume = (
+                block.vid_header and
+                block.vid_header.volume_id == volume_id
+            )
+
+            if not in_volume:
+                continue
+
+            self.blocks[block_id] = PhysicalEraseBlock(
+                block_id=block_id,
+                erase_counter_header=EraseCounterHeader(),
+                data_size=block.data_size,
+                block_size=block.block_size
+            )
+
+    def put_volume_blocks(self, volume_id, data):
+        lebs = calculate_lebs(data, self.data_size)
+        free_blocks = list(self.get_free_blocks().items())
+
+        if len(free_blocks) < len(lebs):
+            return False
+
+        for leb, block_data in lebs.items():
+            block_id, block = free_blocks[0]
+
+            self.blocks[block_id] = PhysicalEraseBlock(
+                block_id=block_id,
+                erase_counter_header=EraseCounterHeader(),
+                volume_identifier_header=VolumeIdentifierHeader(
+                    volume_id=volume_id,
+                    logical_erase_block_number=leb,
+                ),
+                data=block_data,
+                data_size=block.data_size,
+                block_size=block.block_size
+            )
+
+            del free_blocks[0]
+
+        return True
+
     def get_logical_erase_blocks(self, volume_id):
         volume_blocks = []
 
         for block in self.blocks:
             in_volume = (
-                block.vid_header.is_magic_valid and
+                block.vid_header and
                 block.vid_header.volume_id == volume_id
             )
 
@@ -536,7 +610,7 @@ class UnsortedBlockImages(StreamStructure):
         logical_erase_blocks = self.get_logical_erase_blocks(volume_table_record.volume_id)
         volume = b''
 
-        for block_id in range(volume_table_record.reserved_physical_erase_blocks):
+        for block_id in range(volume_table_record.reserved_pebs):
             block = logical_erase_blocks.get(block_id)
 
             if not block:
@@ -639,7 +713,7 @@ prepare_pebs = prepare_physical_erase_blocks
 
 
 def calculate_logical_erase_blocks(image, data_size):
-    lebs = []
+    lebs = {}
 
     blocks = ceil(len(image) / data_size)
     empty_data = b'\xFF' * data_size
@@ -651,7 +725,7 @@ def calculate_logical_erase_blocks(image, data_size):
         block_data = image[start_position:end_position]
 
         if block_data != empty_data:
-            lebs.append(index)
+            lebs[index] = block_data
 
     return lebs
 

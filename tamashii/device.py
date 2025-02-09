@@ -9,11 +9,15 @@ from .utilities import StreamStructure
 
 class DeviceImageHeader(StreamStructure):
     FIELDS = [
-        ('magic_signature', 'bytes:4'),
+        ('magic_signature', 'uint:32'),
         ('header_size', 'uint:32'),
         ('image_size', 'uint:32'),
         ('image_sha1', 'bytes:20'),
     ]
+
+    @property
+    def is_magic_valid(self):
+        return self.magic_signature == 0x8E73ED8A
 
     def to_json(self):
         json = super().to_json()
@@ -53,10 +57,10 @@ class DeviceImage(StreamStructure):
         )
 
     def to_bytes(self):
-        return b''.join([
-            self.header.to_bytes(),
-            self.image
-        ])
+        result = self.header.to_bytes()
+        result += b'\xFF' * (self.header.header_size - len(result))
+        result += self.image
+        return result
 
     def get_image_sha1(self):
         return SHA1(self.image).digest()
@@ -80,22 +84,21 @@ class DeviceImage(StreamStructure):
     def refresh_image_sha1(self):
         self.header.image_sha1 = self.get_image_sha1()
 
-    def update_image(self, data, position):
-        image_size = len(self.image)
+    def put(self, data, position):
+        image_start_position = position - self.header.header_size
+        image_end_position = image_start_position + len(data)
 
-        if position > image_size:
-            raise ValueError('Updated position is larger than the current image!')
+        start_data = self.image[:image_start_position]
 
-        data_size = len(data)
-        end_position = data_size + position
-
-        if end_position > image_size:
-            raise ValueError('Data size is larger than the current image!')
+        if image_end_position < len(self.image):
+            end_data = self.image[image_end_position:]
+        else:
+            end_data = b''
 
         self.image = b''.join([
-            self.image[:position],
+            start_data,
             data,
-            self.image[end_position:]
+            end_data
         ])
 
     def get_image_stream(self):
