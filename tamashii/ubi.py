@@ -318,8 +318,11 @@ class PhysicalEraseBlock(StreamStructure):
         data_position = start_position + ec_header.data_offset
 
         # We then read the data from the block.
-        stream.bytepos = data_position
-        data = stream.read(f'bytes:{data_size}')
+        data = b''
+
+        if ec_header.is_header_valid:
+            stream.bytepos = data_position
+            data = stream.read(f'bytes:{data_size}')
 
         # If the block is valid and internal, then we can parse some volume
         # table records out of its data.

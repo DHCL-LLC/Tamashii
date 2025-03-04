@@ -60,6 +60,10 @@ def extract_volumes(extract_path, ubi, volume_table_records):
         makedirs(path.join(extract_path, 'ubi'), exist_ok=True)
 
     for record in volume_table_records:
+        # TODO: Warn invalid records in the log.
+        if record.volume_type != 1 or not record.is_record_valid:
+            continue
+
         parent_path = path.join(extract_path, f'ubi/volume-{record.volume_id}-{record.name}')
         makedirs(parent_path, exist_ok=True)
 
