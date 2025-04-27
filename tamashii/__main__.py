@@ -2,11 +2,10 @@ from argparse import ArgumentParser
 from os import path, makedirs
 from sys import stdout, stderr
 
-from bitstring import ConstBitStream
 from loguru import logger
 
 from .utilities import to_readable_size
-from .ubi import UnsortedBlockImages, calculate_lebs
+from .ubi import UnsortedBlockImages
 from .device import DeviceImage, DeviceImageHeader
 from .boot import get_boot_arguments, get_fdt_position, get_kernel_position, get_ramdisk_position
 
@@ -123,11 +122,15 @@ def read_image(image_path, extract_path):
     logger.success(f'Detected UBI at: 0x{ubi.start_position:08X}-0x{ubi.end_position:08X} ({len(ubi.blocks)} blocks / {to_readable_size(ubi.block_size)} each)')
 
     volume_table_records = ubi.get_volume_table_records()
-    boot_arguments = get_boot_arguments(data)
 
     extract_start_and_end(extract_path, ubi, data)
     extract_volumes(extract_path, ubi, volume_table_records)
-    extract_device_images(extract_path, ubi, volume_table_records, boot_arguments)
+
+    try:
+        boot_arguments = get_boot_arguments(data)
+        extract_device_images(extract_path, ubi, volume_table_records, boot_arguments)
+    except:
+        logger.error(f'Could not extract device images!')
 
 
 def get_volume_table_record(ubi, volume_id):
